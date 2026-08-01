@@ -15,13 +15,28 @@ const app = express();
 // data (projects, captions, media) lives in the browser's local storage.
 
 // Local dev origins plus the deployed frontend (FRONTEND_URL env var,
-// comma-separated if more than one, e.g. "https://pardex.vercel.app")
+// comma-separated if more than one, e.g. "https://pardex.vercel.app").
+// Vercel also serves the same project from several other URLs — a git-branch
+// alias (pardex-video-editor-git-main-<team>.vercel.app) and a unique URL per
+// deployment (pardex-video-editor-<hash>-<team>.vercel.app) — so match any
+// *.vercel.app subdomain starting with the project name rather than only the
+// one exact production URL.
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
   ...(process.env.FRONTEND_URL ? process.env.FRONTEND_URL.split(',').map((s) => s.trim()) : []),
 ];
-app.use(cors({ origin: allowedOrigins, credentials: true }));
+const vercelPreviewPattern = /^https:\/\/pardex-video-editor(-[a-z0-9-]+)?\.vercel\.app$/;
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin) || vercelPreviewPattern.test(origin)) {
+      return callback(null, true);
+    }
+    callback(new Error(`Origin ${origin} not allowed by CORS`));
+  },
+  credentials: true,
+}));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
