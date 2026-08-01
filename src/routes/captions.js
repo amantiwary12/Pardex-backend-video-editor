@@ -2,8 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const os = require('os');
-const { generateCaptions, getCaptions, updateCaptions } = require('../controllers/captionController');
-const { protect } = require('../middleware/auth');
+const { generateCaptions } = require('../controllers/captionController');
 
 // Disk storage (OS temp) so large videos aren't buffered in RAM. The file is
 // transient — captionController deletes it as soon as transcription ends.
@@ -26,8 +25,7 @@ const upload = multer({
 
 const router = express.Router();
 
-router.use(protect);
-router.post('/generate/:projectId', upload.single('video'), generateCaptions);
-router.route('/:projectId').get(getCaptions).put(updateCaptions);
+// Stateless — no auth, no database. The browser owns all project data.
+router.post('/generate', upload.single('video'), generateCaptions);
 
 module.exports = router;

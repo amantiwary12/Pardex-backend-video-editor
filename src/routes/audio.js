@@ -3,7 +3,6 @@ const multer = require('multer');
 const path = require('path');
 const os = require('os');
 const { extractFromVideo, applyEffects } = require('../controllers/audioController');
-const { protect } = require('../middleware/auth');
 
 // Temp-only storage — controllers delete these files right after processing.
 const storage = multer.diskStorage({
@@ -34,7 +33,6 @@ const uploadAudio = multer({
 
 const router = express.Router();
 
-router.use(protect);
 router.post('/extract', uploadVideo.single('video'), extractFromVideo);
 router.post('/process', uploadAudio.single('audio'), applyEffects);
 
