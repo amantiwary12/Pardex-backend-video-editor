@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Environment (contains MONGO_URL, JWT_SECRET_KEY — never commit)
+.env
+.env.*
+
+# Logs
+*.log
+npm-debug.log*
+
+# Temp / uploads (multer temp files if ever written locally)
+tmp/
+uploads/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,194 @@
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { pipeline } = require('@xenova/transformers');
+const ffmpeg = require('fluent-ffmpeg');
+
+const ffmpegPath = require('ffmpeg-static');
+if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
+
+const { toHinglish } = require('./hinglish');
+
+const round2 = (n) => parseFloat((n || 0).toFixed(2));
+
+// Caption language presets. Whisper's 'translate' task turns any spoken
+// language into English text; 'transcribe' keeps the spoken language.
+const LANGUAGE_PRESETS = {
+  english: { task: 'translate' },                                        // any speech → English captions
+  hindi: { language: 'hindi', task: 'transcribe' },                      // Hindi speech → हिंदी captions
+  hinglish: { language: 'hindi', task: 'transcribe', romanize: true },   // Hindi speech → "kya kar rahe ho"
+};
+
+// Whisper Small (multilingual, ~190MB quantized) — fits in RAM on modest
+// laptops, unlike Large V3 (~1.5GB) which OOMs on 8GB machines.
+const WHISPER_MODEL = process.env.WHISPER_MODEL || 'Xenova/whisper-small';
+
+let transcriber = null;
+
+async function getTranscriber() {
+  if (!transcriber) {
+    console.log(`[whisper] Loading ${WHISPER_MODEL} (first load downloads the model)…`);
+    const start = Date.now();
+    transcriber = await pipeline('automatic-speech-recognition', WHISPER_MODEL, {
+      quantized: true,
+    });
+    console.log(`[whisper] Model loaded in ${((Date.now() - start) / 1000).toFixed(1)}s`);
+  }
+  return transcriber;
+}
+
+function extractAudio(videoUrl, outputPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(videoUrl)
+      .noVideo()
+      .audioCodec('pcm_s16le')
+      .audioFrequency(16000)
+      .audioChannels(1)
+      .format('s16le')
+      .on('end', () => resolve(outputPath))
+      .on('error', (err) => reject(new Error(`FFmpeg: ${err.message}`)))
+      .save(outputPath);
+  });
+}
+
+function rawPcmToFloat32(filePath) {
+  const buffer = fs.readFileSync(filePath);
+  const int16 = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 2);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / 32768;
+  }
+  return float32;
+}
+
+function splitIntoSentences(text) {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  const raw = trimmed.split(/(?<=[.!?।॥])\s+/);
+  return raw.map(s => s.trim()).filter(Boolean);
+}
+
+function buildSegments(result, durationSec) {
+  const allSegments = [];
+
+  const chunks = result?.chunks?.length ? result.chunks : (
+    result?.text ? [{ timestamp: [0, durationSec || 30], text: result.text }] : []
+  );
+
+  chunks.forEach((chunk, ci) => {
+    const text = chunk.text.trim();
+    if (!text) return;
+    const chunkStart = round2(chunk.timestamp?.[0] ?? 0);
+    // Whisper sometimes returns null for the final chunk's end — fall back to
+    // the audio duration instead of dropping the chunk.
+    const rawEnd = chunk.timestamp?.[1];
+    const chunkEnd = round2(rawEnd == null ? Math.max(durationSec || 0, chunkStart + 1) : rawEnd);
+    const chunkDur = chunkEnd - chunkStart;
+    if (chunkDur <= 0) return;
+
+    const allChunkWords = text.split(/\s+/);
+    const totalWords = allChunkWords.length;
+
+    const sentences = splitIntoSentences(text);
+
+    let wordOffset = 0;
+    let sentenceCursor = chunkStart;
+
+    sentences.forEach((sentence, si) => {
+      const sWords = sentence.split(/\s+/);
+      const wordCount = sWords.length;
+      const ratio = wordCount / totalWords;
+      const sDur = ratio * chunkDur;
+      const sEnd = si < sentences.length - 1
+        ? round2(sentenceCursor + sDur)
+        : chunkEnd;
+
+      const wordDur = sEnd - sentenceCursor > 0 && wordCount > 0
+        ? (sEnd - sentenceCursor) / wordCount
+        : 0.3;
+
+      const wordObjs = sWords.map((w, j) => ({
+        // strip punctuation but keep letters in any script (Devanagari etc.)
+        word: w.replace(/[^\p{L}\p{M}\p{N}'\-]/gu, ''),
+        start: round2(sentenceCursor + j * wordDur),
+        end: round2(sentenceCursor + (j + 1) * wordDur),
+      }));
+
+      allSegments.push({
+        id: `seg-${ci}-${si}-${Math.round(sentenceCursor * 1000)}`,
+        start: sentenceCursor,
+        end: sEnd,
+        text: sentence,
+        words: wordObjs,
+      });
+
+      wordOffset += wordCount;
+      sentenceCursor = sEnd;
+    });
+  });
+
+  return allSegments;
+}
+
+async function transcribeLocal(videoUrl, language = 'english') {
+  const preset = LANGUAGE_PRESETS[language] || LANGUAGE_PRESETS.english;
+  const audioPath = path.join(os.tmpdir(), `whisper-${Date.now()}.raw`);
+
+  try {
+    console.log('[whisper] Extracting audio from video…');
+    await extractAudio(videoUrl, audioPath);
+
+    const samples = rawPcmToFloat32(audioPath);
+    const durationSec = samples.length / 16000;
+    console.log(`[whisper] Audio extracted (${durationSec.toFixed(1)}s, ${samples.length} samples)`);
+
+    if (samples.length < 16000) {
+      console.warn('[whisper] Audio too short (<1s), returning empty');
+      return [];
+    }
+
+    const tr = await getTranscriber();
+
+    console.log(`[whisper] Transcribing (${language})…`);
+    const startTs = Date.now();
+    const result = await tr(samples, {
+      return_timestamps: true,
+      chunk_length_s: 30,
+      stride_length_s: 5,
+      task: preset.task,
+      ...(preset.language ? { language: preset.language } : {}),
+    });
+    console.log(`[whisper] Done in ${((Date.now() - startTs) / 1000).toFixed(1)}s`);
+
+    let segments = buildSegments(result, durationSec);
+
+    if (preset.romanize) {
+      segments = segments.map(s => ({
+        ...s,
+        text: toHinglish(s.text),
+        words: s.words.map(w => ({ ...w, word: toHinglish(w.word) })),
+      }));
+    }
+
+    console.log(`[whisper] Generated ${segments.length} segments`);
+
+    return segments;
+  } catch (err) {
+    console.error('[whisper] Error:', err.message);
+    throw err;
+  } finally {
+    if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+  }
+}
+
+async function preloadModel() {
+  console.log('[whisper] Preloading model on startup…');
+  try {
+    await getTranscriber();
+    console.log('[whisper] Preload complete');
+  } catch (err) {
+    console.error('[whisper] Preload failed:', err.message);
+  }
+}
+
+module.exports = { transcribeLocal, preloadModel };
