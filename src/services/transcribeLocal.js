@@ -130,6 +130,16 @@ function buildSegments(result, durationSec) {
   return allSegments;
 }
 
+const SAMPLE_RATE = 16000;
+
+// transformers.js accumulates memory for the whole input across a single
+// pipeline call — for a 27-minute video this grew past 4.5GB and OOM'd on an
+// 8GB machine. Transcribing in bounded windows (separate calls) keeps peak
+// memory roughly constant no matter how long the video is. Override via
+// WHISPER_WINDOW_SECONDS if a server has more RAM to spare (fewer, larger
+// windows means less boundary-splitting of words, but higher peak memory).
+const WINDOW_SECONDS = Number(process.env.WHISPER_WINDOW_SECONDS) || 120;
+
 async function transcribeLocal(videoUrl, language = 'english') {
   const preset = LANGUAGE_PRESETS[language] || LANGUAGE_PRESETS.english;
   const audioPath = path.join(os.tmpdir(), `whisper-${Date.now()}.raw`);
@@ -139,10 +149,10 @@ async function transcribeLocal(videoUrl, language = 'english') {
     await extractAudio(videoUrl, audioPath);
 
     const samples = rawPcmToFloat32(audioPath);
-    const durationSec = samples.length / 16000;
+    const durationSec = samples.length / SAMPLE_RATE;
     console.log(`[whisper] Audio extracted (${durationSec.toFixed(1)}s, ${samples.length} samples)`);
 
-    if (samples.length < 16000) {
+    if (samples.length < SAMPLE_RATE) {
       console.warn('[whisper] Audio too short (<1s), returning empty');
       return [];
     }
@@ -151,16 +161,39 @@ async function transcribeLocal(videoUrl, language = 'english') {
 
     console.log(`[whisper] Transcribing (${language})…`);
     const startTs = Date.now();
-    const result = await tr(samples, {
-      return_timestamps: true,
-      chunk_length_s: 30,
-      stride_length_s: 5,
-      task: preset.task,
-      ...(preset.language ? { language: preset.language } : {}),
-    });
-    console.log(`[whisper] Done in ${((Date.now() - startTs) / 1000).toFixed(1)}s`);
+    const windowSamples = WINDOW_SECONDS * SAMPLE_RATE;
+    const windowCount = Math.ceil(samples.length / windowSamples);
+    let segments = [];
 
-    let segments = buildSegments(result, durationSec);
+    for (let w = 0; w < windowCount; w++) {
+      const offset = w * windowSamples;
+      const end = Math.min(offset + windowSamples, samples.length);
+      const windowStart = offset / SAMPLE_RATE;
+      const windowDur = (end - offset) / SAMPLE_RATE;
+
+      console.log(`[whisper] Window ${w + 1}/${windowCount} (${windowStart.toFixed(0)}s–${(windowStart + windowDur).toFixed(0)}s)…`);
+      const result = await tr(samples.subarray(offset, end), {
+        return_timestamps: true,
+        chunk_length_s: 30,
+        stride_length_s: 5,
+        task: preset.task,
+        ...(preset.language ? { language: preset.language } : {}),
+      });
+
+      const windowSegments = buildSegments(result, windowDur).map((s) => ({
+        ...s,
+        id: `w${w}-${s.id}`,
+        start: round2(s.start + windowStart),
+        end: round2(s.end + windowStart),
+        words: s.words.map((wd) => ({
+          ...wd,
+          start: round2(wd.start + windowStart),
+          end: round2(wd.end + windowStart),
+        })),
+      }));
+      segments.push(...windowSegments);
+    }
+    console.log(`[whisper] Done in ${((Date.now() - startTs) / 1000).toFixed(1)}s`);
 
     if (preset.romanize) {
       segments = segments.map(s => ({
