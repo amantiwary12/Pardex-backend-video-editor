@@ -55,5 +55,15 @@ const PORT = process.env.PORT || 5000;
   if (process.env.WHISPER_PRELOAD !== 'false') {
     await preloadModel();
   }
-  app.listen(PORT, () => console.log(`Pardex server running on port ${PORT}`));
+  const server = app.listen(PORT, () => console.log(`Pardex server running on port ${PORT}`));
+
+  // Caption/audio requests carry multi-hundred-MB video uploads and then wait
+  // minutes for CPU transcription. Node's default requestTimeout (5 min) RSTs
+  // the socket if the upload hasn't fully arrived by then — on a slow or
+  // memory-pressured machine a big upload can exceed that, which surfaces in
+  // the browser as net::ERR_CONNECTION_RESET. Disable the per-request clocks;
+  // headersTimeout stays at its default so idle sockets still get cleaned up.
+  server.requestTimeout = 0;
+  server.timeout = 0;
+  server.keepAliveTimeout = 60 * 1000;
 })();
