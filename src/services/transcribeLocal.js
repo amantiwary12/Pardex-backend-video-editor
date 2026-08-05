@@ -21,7 +21,13 @@ const LANGUAGE_PRESETS = {
 
 // Whisper Small (multilingual, ~190MB quantized) — fits in RAM on modest
 // laptops, unlike Large V3 (~1.5GB) which OOMs on 8GB machines.
-const WHISPER_MODEL = process.env.WHISPER_MODEL || 'Xenova/whisper-small';
+// On Render's free tier (512MB RAM) even whisper-small OOMs mid-transcription
+// (observed peak 465-855MB): the instance is killed and the browser sees the
+// connection drop with no response. Render sets RENDER=true in every service's
+// env, so default to whisper-tiny there; WHISPER_MODEL always wins if set.
+const ON_SMALL_SERVER = process.env.RENDER === 'true' || process.env.SMALL_SERVER === 'true';
+const WHISPER_MODEL = process.env.WHISPER_MODEL
+  || (ON_SMALL_SERVER ? 'Xenova/whisper-tiny' : 'Xenova/whisper-small');
 
 let transcriber = null;
 
@@ -138,7 +144,8 @@ const SAMPLE_RATE = 16000;
 // memory roughly constant no matter how long the video is. Override via
 // WHISPER_WINDOW_SECONDS if a server has more RAM to spare (fewer, larger
 // windows means less boundary-splitting of words, but higher peak memory).
-const WINDOW_SECONDS = Number(process.env.WHISPER_WINDOW_SECONDS) || 120;
+const WINDOW_SECONDS = Number(process.env.WHISPER_WINDOW_SECONDS)
+  || (ON_SMALL_SERVER ? 45 : 120);
 
 async function transcribeLocal(videoUrl, language = 'english') {
   const preset = LANGUAGE_PRESETS[language] || LANGUAGE_PRESETS.english;
